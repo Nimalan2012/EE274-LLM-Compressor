@@ -19,7 +19,7 @@ if root_dir not in sys.path:
     sys.path.append(root_dir)
 
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM, logging as hf_logging
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig, MambaConfig, MambaForCausalLM, logging as hf_logging
 from scl.compressors.arithmetic_coding import AECParams, ArithmeticEncoder, ArithmeticDecoder  
 from scl.core.data_block import DataBlock
 from scl.core.prob_dist import Frequencies
@@ -65,6 +65,7 @@ def load_tokenizer_and_model(
         # tinyllama is small; load normally
         tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False, use_auth_token=use_auth)
         model = AutoModelForCausalLM.from_pretrained(model_name, dtype=dtype, low_cpu_mem_usage=True, use_auth_token=use_auth)
+        model.to(device)  # Move to device after loading
     
     elif model_choice == "llama3":
         # Large gated model (70B). This will likely fail locally without proper hardware/auth.
@@ -83,21 +84,22 @@ def load_tokenizer_and_model(
         except Exception as e:
             print("Warning: automatic device_map loading failed for LLaMA-3. Attempting CPU/memory-conservative load.")
             model = AutoModelForCausalLM.from_pretrained(model_name, dtype=dtype, low_cpu_mem_usage=True, use_auth_token=use_auth)
+            model.to(device)  # Move to device after loading
     
     elif model_choice == "mamba":
         # use state-spaces / Mamba small model
-        model_name = "state-spaces/mamba-130m"
-        tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False, use_auth_token=use_auth)
-        model = AutoModelForCausalLM.from_pretrained(model_name, dtype=dtype, low_cpu_mem_usage=True, use_auth_token=use_auth)
+        model_name = "state-spaces/mamba-130m-hf"
+        tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b", use_fast=True, use_auth_token=use_auth)
+        config = MambaConfig.from_pretrained("state-spaces/mamba-130m-hf")
+        model = MambaForCausalLM.from_pretrained(
+          "state-spaces/mamba-130m-hf",
+          config=config,
+          dtype=dtype,
+          device_map=None
+        )
+        model.to(device)
     else:
         raise ValueError(f"Unknown model choice: {model_choice}")
-
-    # Move model to device where appropriate (if model wasn't already device-mapped)
-    try:
-        model.to(device)
-    except Exception:
-        # device_map='auto' may have already distributed the model; ignore.
-        pass
 
     model.eval()
     torch.set_grad_enabled(False)
@@ -146,6 +148,8 @@ class LLMFreqModel(FreqModelBase):
         # Context storage
         self.context_tokens = []
 
+        self.is_mamba = "mamba" in model.config.model_type.lower()
+
         # Limits
         self.context_max = getattr(tokenizer, "model_max_length", 2048)
         self.MAX_CONTEXT_FEED = min(max_context_feed, self.context_max)
@@ -153,10 +157,17 @@ class LLMFreqModel(FreqModelBase):
 
         # KV cache
         self.past_key_values = None
-        self._cached_next_logits_gpu = None  
+        self._cached_next_logits_gpu = None
+        self._cached_next_logits = None
+  
 
         # vocab size
         self.vocab_size = tokenizer.vocab_size
+        
+        # Cache for Mamba
+        self.cache_params = None
+        self.seq_len = 0
+        
 
     def update_model(self, symbol: int):
         """
@@ -168,21 +179,43 @@ class LLMFreqModel(FreqModelBase):
         if len(self.context_tokens) > self.MAX_CONTEXT_FEED:
             self.context_tokens = self.context_tokens[-self.MAX_CONTEXT_FEED:]
 
-        if self.past_key_values is not None:
-            input_ids = torch.tensor([[symbol]], dtype=torch.long, device=self.device)
+        input_ids = torch.tensor([[symbol]], dtype=torch.long, device=self.device)
+        
+        with torch.no_grad():
+            if self.is_mamba:
+              # Mamba Path
+              if self.cache_params is None:
 
-            with torch.no_grad():
-                outputs = self.model(
-                    input_ids=input_ids,
-                    past_key_values=self.past_key_values,
-                    use_cache=True
-                )
+                # Initialize or Recovery
+                  outputs = self.model(input_ids=input_ids, use_cache=True)
+                  self.seq_len = 1 
+              else:
+                  # Incremental Step: Must pass cache_position
+                  cache_position = torch.tensor([self.seq_len], device=self.device)
+                  outputs = self.model(
+                      input_ids=input_ids, 
+                      cache_params=self.cache_params, 
+                      use_cache=True, 
+                      cache_position=cache_position
+                  )
+                  self.seq_len += 1
+              
+              self.cache_params = outputs.cache_params
+              self._cached_next_logits_gpu = outputs.logits[:, -1, :]
 
-            self.past_key_values = outputs.past_key_values
-            self._cached_next_logits_gpu = outputs.logits[:, -1, :]  
-
-        else:
-            self._cached_next_logits_gpu = None  
+            else:
+              # Transformer Path
+              if self.past_key_values is not None:
+                  outputs = self.model(
+                      input_ids=input_ids,
+                      past_key_values=self.past_key_values,
+                      use_cache=True
+                  )
+                  self.past_key_values = outputs.past_key_values
+                  self._cached_next_logits_gpu = outputs.logits[:, -1, :]
+              else:
+                  # Fallback if cache was somehow lost (shouldn't happen in loop)
+                  self._cached_next_logits_gpu = None               
 
     @property
     def freqs_current(self) -> Frequencies:
@@ -195,20 +228,31 @@ class LLMFreqModel(FreqModelBase):
             return Frequencies({i: 1 for i in range(self.vocab_size)})
 
         # FAST PATH – GPU cached logits
-        if self._cached_next_logits_gpu is not None and self.past_key_values is not None:
+        has_cache = (self.is_mamba and self.cache_params is not None) or \
+                    (not self.is_mamba and self.past_key_values is not None)
+
+        if self._cached_next_logits_gpu is not None and has_cache:
             probs_gpu = torch.softmax(self._cached_next_logits_gpu.float(), dim=-1)
             probs = probs_gpu.squeeze().cpu().numpy()  # convert ONCE
             return self._probs_to_freqs(probs)
 
-        # SLOW PATH – initial warmup
+        # SLOW PATH – initial warmup to feed full context
         context = self.context_tokens[-self.MAX_CONTEXT_FEED:]
-        input_ids = torch.tensor([context], dtype=torch.long, device=self.device)
-
+        input_ids = torch.tensor([context], device=self.device)
+        
+        
         with torch.no_grad():
-            outputs = self.model(input_ids=input_ids, use_cache=True)
+          if self.is_mamba:
+              # Reset Mamba State
+              outputs = self.model(input_ids=input_ids, use_cache=True)
+              self.cache_params = outputs.cache_params
+              self.seq_len = len(context) # Sync sequence length
+          else:
+              # Reset Transformer State
+              outputs = self.model(input_ids=input_ids, use_cache=True)
+              self.past_key_values = outputs.past_key_values
 
-        self.past_key_values = outputs.past_key_values
-        self._cached_next_logits_gpu = outputs.logits[:, -1, :]
+          self._cached_next_logits_gpu = outputs.logits[:, -1, :]
 
         probs_gpu = torch.softmax(self._cached_next_logits_gpu.float(), dim=-1)
         probs = probs_gpu.squeeze().cpu().numpy()
