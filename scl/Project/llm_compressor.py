@@ -1,6 +1,25 @@
+import os
 import sys
+try:
+    # Try to get the path if running as a standard script (.py)
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+except NameError:
+    # Fallback: Get the current working directory if running in Jupyter/Interactive
+    # (Assumes notebook/terminal is currently inside the 'Project' folder)
+    current_dir = os.getcwd()
+
+# 1. Go up one level (from 'Project' -> 'scl')
+parent_dir = os.path.dirname(current_dir)
+
+# 2. Go up one more level (from 'scl' -> 'EE274-LLM-Compressor' root)
+root_dir = os.path.dirname(parent_dir)
+
+# 3. Add the root to the path so scl can be imported
+if root_dir not in sys.path:
+    sys.path.append(root_dir)
+
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, logging as hf_logging
 from scl.compressors.arithmetic_coding import AECParams, ArithmeticEncoder, ArithmeticDecoder  
 from scl.core.data_block import DataBlock
 from scl.core.prob_dist import Frequencies
@@ -9,29 +28,92 @@ from scl.compressors.probability_models import FreqModelBase
 import math
 import numpy as np
 import copy
-from typing import List, Dict
+from typing import List, Dict, Optional
 import time
 
 # -------------------------
-# 1. Load TinyLlama 
+# Utilities: model loader
 # -------------------------
-MODEL_NAME = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+def choose_device() -> torch.device:
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    
+    # MPS on macOS
+    if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
 
-print("Device:", "GPU" if torch.cuda.is_available() else "CPU")
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-print("Loading tokenizer...")
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=False)
+def load_tokenizer_and_model(
+    model_choice: str,
+    dtype: torch.dtype,
+    hf_token: Optional[str] = None,
+):
+    """
+    Load tokenizer and model according to user's choice.
+    model_choice: 'tinyllama', 'llama3', 'mamba'
+    dtype: torch.float16 or torch.float32
+    Returns: (tokenizer, model, device)
+    """
+    device = choose_device()
+    print(f"Selected device: {device}")
 
-print("Loading model")
+    use_auth = hf_token if hf_token else None
 
-model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, dtype=torch.float32, low_cpu_mem_usage=True)
-model.to(device)
-model.eval()
-torch.set_grad_enabled(False)
+    if model_choice == "tinyllama":
+        model_name = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+        # tinyllama is small; load normally
+        tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False, use_auth_token=use_auth)
+        model = AutoModelForCausalLM.from_pretrained(model_name, dtype=dtype, low_cpu_mem_usage=True, use_auth_token=use_auth)
+    
+    elif model_choice == "llama3":
+        # Large gated model (70B). This will likely fail locally without proper hardware/auth.
+        model_name = "meta-llama/Meta-Llama-3.3-70B-Instruct"
+        tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False, use_auth_token=use_auth)
+        # Attempt to use device_map='auto' if CUDA is available for large model
+        try:
+            # prefer device_map auto when CUDA is present
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                dtype=dtype,
+                low_cpu_mem_usage=True,
+                device_map="auto" if torch.cuda.is_available() else None,
+                use_auth_token=use_auth,
+            )
+        except Exception as e:
+            print("Warning: automatic device_map loading failed for LLaMA-3. Attempting CPU/memory-conservative load.")
+            model = AutoModelForCausalLM.from_pretrained(model_name, dtype=dtype, low_cpu_mem_usage=True, use_auth_token=use_auth)
+    
+    elif model_choice == "mamba":
+        # use state-spaces / Mamba small model
+        model_name = "state-spaces/mamba-130m"
+        tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False, use_auth_token=use_auth)
+        model = AutoModelForCausalLM.from_pretrained(model_name, dtype=dtype, low_cpu_mem_usage=True, use_auth_token=use_auth)
+    else:
+        raise ValueError(f"Unknown model choice: {model_choice}")
+
+    # Move model to device where appropriate (if model wasn't already device-mapped)
+    try:
+        model.to(device)
+    except Exception:
+        # device_map='auto' may have already distributed the model; ignore.
+        pass
+
+    model.eval()
+    torch.set_grad_enabled(False)
+
+    # Print a short summary
+    try:
+        num_params = sum(p.numel() for p in model.parameters())
+        print(f"Loaded {model_choice} ({model_name}) model with ~{num_params:,} parameters (dtype={dtype}).")
+    except Exception:
+        print(f"Loaded {model_choice} model: {model_name} (dtype={dtype}).")
+
+    return tokenizer, model, device
+
 
 # -------------------------
-# 2. LLM-based Frequency Model
+# LLM-based Frequency Model
 # -------------------------
 class LLMFreqModel(FreqModelBase):
     """
@@ -45,19 +127,27 @@ class LLMFreqModel(FreqModelBase):
     6. Designed for use with SCL arithmetic coder.
     """
 
-    def __init__(self, tokenizer, model, params: AECParams,
-                 context_max_tokens=None, max_context_feed=512, device_override=None):
+    def __init__(
+        self,
+        tokenizer,
+        model,
+        device: torch.device,
+        params: AECParams,
+        context_tokens: Optional[List[int]] = None,
+        max_context_feed: int = 512,
+        top_k: int = 1024,
+    ):
 
         self.tokenizer = tokenizer
         self.model = model
         self.params = params
-        self.device = device_override or device
+        self.device = device
 
         # Context storage
         self.context_tokens = []
 
         # Limits
-        self.context_max = context_max_tokens or getattr(tokenizer, "model_max_length", 2048)
+        self.context_max = getattr(tokenizer, "model_max_length", 2048)
         self.MAX_CONTEXT_FEED = min(max_context_feed, self.context_max)
         self.max_total_freq = max(1, params.MAX_ALLOWED_TOTAL_FREQ - 1)
 
@@ -106,7 +196,7 @@ class LLMFreqModel(FreqModelBase):
 
         # FAST PATH – GPU cached logits
         if self._cached_next_logits_gpu is not None and self.past_key_values is not None:
-            probs_gpu = torch.softmax(self._cached_next_logits_gpu, dim=-1)
+            probs_gpu = torch.softmax(self._cached_next_logits_gpu.float(), dim=-1)
             probs = probs_gpu.squeeze().cpu().numpy()  # convert ONCE
             return self._probs_to_freqs(probs)
 
@@ -120,7 +210,7 @@ class LLMFreqModel(FreqModelBase):
         self.past_key_values = outputs.past_key_values
         self._cached_next_logits_gpu = outputs.logits[:, -1, :]
 
-        probs_gpu = torch.softmax(self._cached_next_logits_gpu, dim=-1)
+        probs_gpu = torch.softmax(self._cached_next_logits_gpu.float(), dim=-1)
         probs = probs_gpu.squeeze().cpu().numpy()
         return self._probs_to_freqs(probs)
 
@@ -130,26 +220,27 @@ class LLMFreqModel(FreqModelBase):
         Ensures no zero frequencies and total frequency does not exceed max_total_freq.
         This ensures arithmetic coder gets valid frequency tables.
         """
+        # Scale to integer frequencies 
         scaled = probs * self.max_total_freq
         int_freqs = scaled.astype(np.int32)
-        int_freqs[int_freqs < 1] = 1
+        np.maximum(int_freqs, 1, out=int_freqs)
 
+        # Normalize sum 
         total = int_freqs.sum()
         if total > self.max_total_freq:
             factor = self.max_total_freq / total
-            int_freqs = np.maximum(1, (int_freqs * factor).astype(np.int32))
+            int_freqs = (int_freqs * factor).astype(np.int32)
+            np.maximum(int_freqs, 1, out=int_freqs)
 
-        return Frequencies({i: int(int_freqs[i]) for i in range(len(int_freqs))})
+        # Critical Optimization: Convert to list before dict creation
+        return Frequencies(dict(enumerate(int_freqs.tolist())))
 
-
-        return Frequencies({i: int(int_freqs[i]) for i in range(len(int_freqs))})
-
-def tokens_from_text_in_chunks(text: str, max_chunk_tokens: int = 512):
+def tokens_from_text_in_chunks(tokenizer, text: str, max_chunk_tokens: int = 512):
     """
     Yield token chunks from a long text, never exceeding max_chunk_tokens.
     This prevents context overflow in the LLM. (Max 2048 tokens for TinyLlama.)
     """
-    vocab_size = tokenizer.vocab_size if hasattr(tokenizer, "vocab_size") else tokenizer.model_max_length
+    # vocab_size = tokenizer.vocab_size if hasattr(tokenizer, "vocab_size") else tokenizer.model_max_length
     start = 0
     text_len = len(text)
     while start < text_len:
@@ -160,7 +251,7 @@ def tokens_from_text_in_chunks(text: str, max_chunk_tokens: int = 512):
         yield tokens
         start += len(chunk_text)
 
-def text_from_tokens(token_ids: List[int]) -> str:
+def text_from_tokens(token_ids: List[int], tokenizer) -> str:
     # 1. Remove special tokens safely (BOS, EOS, UNK, PAD, system tokens)
     cleaned = [tid for tid in token_ids if tid not in tokenizer.all_special_ids]
 
@@ -168,9 +259,18 @@ def text_from_tokens(token_ids: List[int]) -> str:
     return tokenizer.decode(cleaned, skip_special_tokens=True)
 
 # -------------------------
-# 4. Compression / Decompression functions
+# Compression / Decompression functions
 # -------------------------
-def compress_text_to_bitarray(text: str, params: AECParams, freq_model_factory, chunk_size=512):
+def compress_text_to_bitarray(
+    tokenizer,
+    model,
+    device: torch.device,
+    text: str,
+    params: AECParams,
+    freq_model_factory,
+    chunk_size: int = 512,
+    context_size: int = 512,
+    top_k: int = 1024) -> BitArray:
     """
     Compress text using ArithmeticEncoder and freq_model_factory to create a fresh freq_model
     For each token chunk: text → tokens → arithmetic encoder → bitarray
@@ -179,17 +279,27 @@ def compress_text_to_bitarray(text: str, params: AECParams, freq_model_factory, 
     full_bits = BitArray()
 
     # Tokenize and yield chunks
-    freq_model_enc = freq_model_factory(params)
-    encoder = ArithmeticEncoder(params, freq_model_enc)
 
-    for token_chunk in tokens_from_text_in_chunks(text, max_chunk_tokens=chunk_size):
+
+    for token_chunk in tokens_from_text_in_chunks(tokenizer, text, max_chunk_tokens=chunk_size):
+        freq_model_enc = freq_model_factory(params)
+        encoder = ArithmeticEncoder(params, freq_model_enc)
         data_block = DataBlock(token_chunk)
         encoded_chunk = encoder.encode_block(data_block)
         full_bits.extend(encoded_chunk)
 
     return full_bits
 
-def decompress_bitarray_to_text(encoded_bitarray: BitArray, params: AECParams, freq_model_factory, chunk_size=512):
+def decompress_bitarray_to_text(
+    tokenizer, 
+    model, 
+    device: torch.device, 
+    encoded_bitarray: BitArray, 
+    params: AECParams, 
+    freq_model_factory,
+    chunk_size: int = 512, 
+    context_size: int = 512, 
+    top_k: int = 1024) -> str:
     """
     Decode using ArithmeticDecoder and freq_model_factory to create a fresh freq_model (decoder uses its own copy)
     For each token chunk: bitarray → arithmetic decoder → tokens → text
@@ -205,23 +315,41 @@ def decompress_bitarray_to_text(encoded_bitarray: BitArray, params: AECParams, f
         decoded_tokens.extend(decoded_block.data_list)
         pos += used
 
-    return text_from_tokens(decoded_tokens)
+    return text_from_tokens(decoded_tokens, tokenizer)
 
 # -------------------------
-# 5. CLI / demo
+# CLI / demo
 # -------------------------
 def main_demo():
     """
     Runs compression/decompression pipeline demo.
     Compresses input text file (or demo text) and decompresses to verify correctness.
     """
+    # Parse command line arguments
     import argparse
-    parser = argparse.ArgumentParser(description="LLM-based compression demo using SCL arithmetic coder (TinyLlama).")
-    parser.add_argument("--infile", type=str, default=None, help="Path to input text file. If omitted, a short demo sentence is used.")
-    parser.add_argument("--outfile", type=str, default="out.sclbit", help="Path to write compressed bits (not used for decompression here).")
-    parser.add_argument("--precision", type=int, default=32, help="Arithmetic coder precision (bits). Default 32.")
-    args = parser.parse_args()
+    p = argparse.ArgumentParser(description="LLM-based compression demo using SCL arithmetic coder (refactored).")
+    p.add_argument("--model", type=str, default="tinyllama", choices=["tinyllama", "llama3", "mamba"], help="Model backend")
+    p.add_argument("--dtype", type=str, default="fp16", choices=["fp16", "fp32"], help="Numeric precision")
+    p.add_argument("--hf-token", type=str, default=None, help="HuggingFace token (optional)")
+    p.add_argument("--infile", type=str, default=None, help="Input text file (if omitted, demo sentence used)")
+    p.add_argument("--outfile", type=str, default="out.sclbit", help="Output compressed file")
+    p.add_argument("--chunk-size", type=int, default=512, help="Token chunk size")
+    p.add_argument("--context-size", type=int, default=512, help="Context size fed to LLM (<= model max)")
+    p.add_argument("--top-k", type=int, default=1024, help="Top-K tokens to convert to frequency table (performance)")
+    p.add_argument("--precision", type=int, default=32, help="Arithmetic coder precision (bits)")
 
+    args = p.parse_args()
+
+    # Load model and tokenizer
+    dtype = torch.float16 if args.dtype == "fp16" else torch.float32
+    print(f"\n=== Loading Model: {args.model} (dtype={args.dtype}) ===")
+    tokenizer, model, device = load_tokenizer_and_model(
+        model_choice=args.model,
+        dtype=dtype,
+        hf_token=args.hf_token
+    )
+    
+    # Load input text
     if args.infile:
         with open(args.infile, "r", encoding="utf-8") as f:
             text = f.read()
@@ -232,12 +360,29 @@ def main_demo():
 
     # Frequency model factory to create encoder/decoder models (fresh instances)
     def freq_model_factory(p):
-        return LLMFreqModel(tokenizer, model, p, context_max_tokens=tokenizer.model_max_length)
+        return LLMFreqModel(
+            tokenizer=tokenizer,
+            model=model,
+            device=device,
+            params=p,
+            max_context_feed=args.context_size,
+            top_k=args.top_k
+        )
 
     print("=== Compressing ===")
     start_time = time.time()
 
-    encoded_bitarray = compress_text_to_bitarray(text, params, freq_model_factory)
+    encoded_bitarray = compress_text_to_bitarray(
+        tokenizer,
+        model,
+        device,
+        text,
+        params,
+        freq_model_factory,
+        chunk_size=512,
+        context_size=512,
+        top_k=1024
+    )
     end_time = time.time()
     compression_time = end_time - start_time
 
@@ -280,7 +425,17 @@ def main_demo():
     loaded = loaded[:bit_length]
 
     start_dec = time.time()
-    recovered_text = decompress_bitarray_to_text(loaded, params, freq_model_factory)
+    recovered_text = decompress_bitarray_to_text(
+        tokenizer,
+        model,
+        device,
+        loaded,
+        params,
+        freq_model_factory,
+        chunk_size=args.chunk_size,
+        context_size=args.context_size,
+        top_k=args.top_k,
+    )
     end_dec = time.time()
     decompression_time = end_dec - start_dec
 
