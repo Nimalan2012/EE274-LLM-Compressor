@@ -17,7 +17,7 @@ Note: Gated models (e.g., Llama-3) may require a Hugging Face token and substant
 Run the following commands in a Colab cell to clone the repo and navigate to the project folder:
 
 ```bash
-!git clone [https://github.com/Nimalan2012/EE274-LLM-Compressor.git](https://github.com/Nimalan2012/EE274-LLM-Compressor.git)
+!git clone https://github.com/Nimalan2012/EE274-LLM-Compressor.git
 %cd EE274-LLM-Compressor/scl/Project
 ```
 ### 2. Install Dependencies
