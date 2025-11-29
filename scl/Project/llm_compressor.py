@@ -169,7 +169,7 @@ class MetricsLog:
         # We need to access the probability distribution from the model
 
         p = dist.probability(actual_token)
-        p = max(p, 1e-12) # Avoid log(0)
+        p = max(float(p), 1e-12) # Avoid log(0)
         self.theoretical_bits += -math.log2(p)
         self.model_entropies.append(dist.entropy)
         self.token_count += 1
@@ -240,7 +240,6 @@ class LLMFreqModel(FreqModelBase):
         self.device = device
         self.metrics_log = metrics_log
 
-
         # Context storage
         self.context_tokens = []
 
@@ -263,6 +262,7 @@ class LLMFreqModel(FreqModelBase):
         # Cache for Mamba
         self.cache_params = None
         self.seq_len = 0        
+    
 
     def update_model(self, symbol: int):
         """
