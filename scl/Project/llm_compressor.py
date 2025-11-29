@@ -22,7 +22,7 @@ import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig, MambaConfig, MambaForCausalLM, logging as hf_logging
 from scl.compressors.arithmetic_coding import AECParams, ArithmeticEncoder, ArithmeticDecoder  
 from scl.core.data_block import DataBlock
-from scl.core.prob_dist import Frequencies
+from scl.core.prob_dist import Frequencies, ProbabilityDist
 from scl.utils.bitarray_utils import BitArray, bitarray_to_uint, uint_to_bitarray
 from scl.compressors.probability_models import FreqModelBase
 import math
@@ -69,7 +69,7 @@ def load_tokenizer_and_model(
     
     elif model_choice == "llama3":
         # Large gated model (70B). This will likely fail locally without proper hardware/auth.
-        model_name = "meta-llama/Meta-Llama-3.3-70B-Instruct"
+        model_name = "meta-llama/Llama-3.3-70B-Instruct"
         tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False, use_auth_token=use_auth)
         # Attempt to use device_map='auto' if CUDA is available for large model
         try:
@@ -90,9 +90,22 @@ def load_tokenizer_and_model(
         # use state-spaces / Mamba small model
         model_name = "state-spaces/mamba-130m-hf"
         tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b", use_fast=True, use_auth_token=use_auth)
-        config = MambaConfig.from_pretrained("state-spaces/mamba-130m-hf")
+        config = MambaConfig.from_pretrained(model_name)
         model = MambaForCausalLM.from_pretrained(
-          "state-spaces/mamba-130m-hf",
+          model_name,
+          config=config,
+          dtype=dtype,
+          device_map=None
+        )
+        model.to(device)
+    
+    elif model_choice == "mamba1.4b":
+        # use state-spaces / Mamba small model
+        model_name = "state-spaces/mamba-1.4b-hf"
+        tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b", use_fast=True, use_auth_token=use_auth)
+        config = MambaConfig.from_pretrained(model_name)
+        model = MambaForCausalLM.from_pretrained(
+          model_name,
           config=config,
           dtype=dtype,
           device_map=None
@@ -113,6 +126,86 @@ def load_tokenizer_and_model(
 
     return tokenizer, model, device
 
+# ---------------------------------
+# Simple Probability Distribution
+# ---------------------------------
+
+class SimpleProbDist:
+    """
+    A lightweight wrapper for probability distributions.
+    Bypasses SCL's strict '1e-6' validation check.
+    LLM probabilities can be very small, so we allow smaller values here.
+    """
+    def __init__(self, probs_array):
+        self.probs = probs_array
+        
+    @property
+    def entropy(self):
+        # Calculate entropy efficiently on the numpy array
+        # Filter out 0s to avoid log(0)
+        p = self.probs
+        p = p[p > 1e-20] # Ignore practically zero values
+        return -np.sum(p * np.log2(p))
+    
+    def probability(self, symbol):
+        if 0 <= symbol < len(self.probs):
+            return self.probs[symbol]
+        return 0.0
+
+# ---------------------
+# Metrics Tracker Class 
+# ---------------------
+
+class MetricsLog:
+    """
+    Class to track compression metrics during encoding.
+    """
+    def __init__(self):
+        self.theoretical_bits = 0.0
+        self.token_count = 0
+        self.model_entropies = [] 
+
+    def log(self, dist, actual_token):
+        # We need to access the probability distribution from the model
+
+        p = dist.probability(actual_token)
+        p = max(p, 1e-12) # Avoid log(0)
+        self.theoretical_bits += -math.log2(p)
+        self.model_entropies.append(dist.entropy)
+        self.token_count += 1
+
+# --- HELPER: Report Generator ---
+def generate_final_report(text, compressed_bits, logs, duration):
+    print("\n" + "="*60)
+    print(f"{'FINAL COMPRESSION REPORT':^60}")
+    print("="*60)
+    
+    # Sizes
+    original_bytes = len(text.encode('utf-8'))
+    original_bits = original_bytes * 8
+    comp_bits = len(compressed_bits)
+    ratio = original_bits / comp_bits if comp_bits > 0 else 0
+    bpb = comp_bits / original_bytes if original_bytes > 0 else 0
+    
+    # Entropy Metrics
+    avg_theoretical = logs.theoretical_bits / max(1, logs.token_count)
+    avg_actual = comp_bits / max(1, logs.token_count)
+    avg_uncertainty = sum(logs.model_entropies) / max(1, len(logs.model_entropies))
+    
+    print(f"1. EFFICIENCY")
+    print(f"   Original Size:    {original_bytes:.0f} bytes")
+    print(f"   Compressed Size:  {comp_bits/8:.2f} bytes")
+    print(f"   Compression Ratio: {ratio:.3f}x")
+    print(f"   Bits Per Byte:    {bpb:.3f} bpb")
+    print(f"   Speed:            {logs.token_count/duration:.1f} tokens/sec")
+
+    
+    print(f"\n2. ENTROPY")
+    print(f"   LLM Theoretical:  {avg_theoretical:.4f} bits/token (Cross-Entropy)")
+    print(f"   Actual SCL Code:  {avg_actual:.4f} bits/token")
+    print(f"   Overhead:         {avg_actual - avg_theoretical:.4f} bits/token")
+    print(f"   Model Uncertainty: {avg_uncertainty:.4f} bits (Avg Entropy)")
+    print("="*60 + "\n")
 
 # -------------------------
 # LLM-based Frequency Model
@@ -138,12 +231,15 @@ class LLMFreqModel(FreqModelBase):
         context_tokens: Optional[List[int]] = None,
         max_context_feed: int = 512,
         top_k: int = 1024,
+        metrics_log=None
     ):
 
         self.tokenizer = tokenizer
         self.model = model
         self.params = params
         self.device = device
+        self.metrics_log = metrics_log
+
 
         # Context storage
         self.context_tokens = []
@@ -166,13 +262,16 @@ class LLMFreqModel(FreqModelBase):
         
         # Cache for Mamba
         self.cache_params = None
-        self.seq_len = 0
-        
+        self.seq_len = 0        
 
     def update_model(self, symbol: int):
         """
         Advance the model by one token with full GPU KV cache.
         """
+        if self.metrics_log:
+            dist = self.get_current_scl_dist()
+            self.metrics_log.log(dist, symbol)
+
         self.context_tokens.append(symbol)
 
         # sliding window of previously encoded tokens to add context
@@ -205,7 +304,7 @@ class LLMFreqModel(FreqModelBase):
 
             else:
               # Transformer Path
-              if self.past_key_values is not None:
+                if self.past_key_values is not None:
                   outputs = self.model(
                       input_ids=input_ids,
                       past_key_values=self.past_key_values,
@@ -213,9 +312,26 @@ class LLMFreqModel(FreqModelBase):
                   )
                   self.past_key_values = outputs.past_key_values
                   self._cached_next_logits_gpu = outputs.logits[:, -1, :]
-              else:
-                  # Fallback if cache was somehow lost (shouldn't happen in loop)
-                  self._cached_next_logits_gpu = None               
+                else:
+                  outputs = self.model(input_ids=input_ids, use_cache=True)
+                
+                self.past_key_values = outputs.past_key_values
+                self._cached_next_logits_gpu = outputs.logits[:, -1, :]
+    
+    def get_current_scl_dist(self):
+        """
+        Returns a probability distribution for the UPCOMING token.
+        Uses SimpleProbDist to avoid SCL AssertionError on small probabilities.
+        """
+        if self._cached_next_logits_gpu is None:
+            # Initial state: Uniform distribution
+            vocab = self.tokenizer.vocab_size
+            probs = np.ones(vocab) / vocab
+            return SimpleProbDist(probs)
+            
+        # Get raw probabilities (no thresholding)
+        probs = torch.softmax(self._cached_next_logits_gpu, dim=-1).squeeze().cpu().numpy()
+        return SimpleProbDist(probs)             
 
     @property
     def freqs_current(self) -> Frequencies:
@@ -290,6 +406,18 @@ def tokens_from_text_in_chunks(tokenizer, text: str, max_chunk_tokens: int = 512
     while start < text_len:
         chunk_text = text[start:start + max_chunk_tokens * 4]  # heuristic: 4 chars ~ 1 token
         tokens = tokenizer.encode(chunk_text, add_special_tokens=False)
+
+        max_vocab_id = tokenizer.vocab_size - 1
+        unk_token_id = tokenizer.unk_token_id if tokenizer.unk_token_id is not None else 0
+        cleaned_tokens = []
+        for token_id in tokens:
+            if token_id >= max_vocab_id:
+                # If the token is out-of-bounds (like 50266), replace it with UNK (0)
+                cleaned_tokens.append(unk_token_id)
+            else:
+                cleaned_tokens.append(token_id)
+        tokens = cleaned_tokens
+
         if len(tokens) > max_chunk_tokens:
             tokens = tokens[:max_chunk_tokens]
         yield tokens
@@ -302,9 +430,6 @@ def text_from_tokens(token_ids: List[int], tokenizer) -> str:
     # 2. Decode while skipping any remaining special tokens
     return tokenizer.decode(cleaned, skip_special_tokens=True)
 
-# -------------------------
-# Compression / Decompression functions
-# -------------------------
 def compress_text_to_bitarray(
     tokenizer,
     model,
@@ -312,9 +437,10 @@ def compress_text_to_bitarray(
     text: str,
     params: AECParams,
     freq_model_factory,
-    chunk_size: int = 512,
-    context_size: int = 512,
-    top_k: int = 1024) -> BitArray:
+    chunk_size: int,
+    metrics_log = None
+    ) -> BitArray:
+    
     """
     Compress text using ArithmeticEncoder and freq_model_factory to create a fresh freq_model
     For each token chunk: text → tokens → arithmetic encoder → bitarray
@@ -323,14 +449,12 @@ def compress_text_to_bitarray(
     full_bits = BitArray()
 
     # Tokenize and yield chunks
-
-
     for token_chunk in tokens_from_text_in_chunks(tokenizer, text, max_chunk_tokens=chunk_size):
-        freq_model_enc = freq_model_factory(params)
+        freq_model_enc = freq_model_factory(params, metrics_log)
         encoder = ArithmeticEncoder(params, freq_model_enc)
-        data_block = DataBlock(token_chunk)
-        encoded_chunk = encoder.encode_block(data_block)
-        full_bits.extend(encoded_chunk)
+        block = DataBlock(token_chunk)
+        encoded_bits = encoder.encode_block(block)
+        full_bits.extend(encoded_bits)
 
     return full_bits
 
@@ -341,9 +465,7 @@ def decompress_bitarray_to_text(
     encoded_bitarray: BitArray, 
     params: AECParams, 
     freq_model_factory,
-    chunk_size: int = 512, 
-    context_size: int = 512, 
-    top_k: int = 1024) -> str:
+    ) -> str:
     """
     Decode using ArithmeticDecoder and freq_model_factory to create a fresh freq_model (decoder uses its own copy)
     For each token chunk: bitarray → arithmetic decoder → tokens → text
@@ -372,7 +494,7 @@ def main_demo():
     # Parse command line arguments
     import argparse
     p = argparse.ArgumentParser(description="LLM-based compression demo using SCL arithmetic coder (refactored).")
-    p.add_argument("--model", type=str, default="tinyllama", choices=["tinyllama", "llama3", "mamba"], help="Model backend")
+    p.add_argument("--model", type=str, default="tinyllama", choices=["tinyllama", "llama3", "mamba", "mamba1.4b"], help="Model backend")
     p.add_argument("--dtype", type=str, default="fp16", choices=["fp16", "fp32"], help="Numeric precision")
     p.add_argument("--hf-token", type=str, default=None, help="HuggingFace token (optional)")
     p.add_argument("--infile", type=str, default=None, help="Input text file (if omitted, demo sentence used)")
@@ -400,21 +522,24 @@ def main_demo():
     else:
         text = "The weather today is sunny and pleasant. I expect light winds and warm sunshine."
 
+
     params = AECParams(DATA_BLOCK_SIZE_BITS=32, PRECISION=args.precision)
 
     # Frequency model factory to create encoder/decoder models (fresh instances)
-    def freq_model_factory(p):
+    def freq_model_factory(p, log=None):
         return LLMFreqModel(
             tokenizer=tokenizer,
             model=model,
             device=device,
             params=p,
             max_context_feed=args.context_size,
-            top_k=args.top_k
+            top_k=args.top_k,
+            metrics_log=log
         )
 
     print("=== Compressing ===")
     start_time = time.time()
+    logs = MetricsLog()
 
     encoded_bitarray = compress_text_to_bitarray(
         tokenizer,
@@ -423,24 +548,14 @@ def main_demo():
         text,
         params,
         freq_model_factory,
-        chunk_size=512,
-        context_size=512,
-        top_k=1024
+        chunk_size=args.chunk_size,
+        metrics_log=logs
     )
     end_time = time.time()
     compression_time = end_time - start_time
-
-    compressed_bits = len(encoded_bitarray)
-    compressed_bytes = compressed_bits / 8
-
-    original_bytes = len(text.encode("utf-8"))
-
-    compression_ratio = original_bytes / compressed_bytes if compressed_bytes > 0 else float("inf")
-    print(f"Compressed length (bits): {compressed_bits}")
-    print(f"Original size (bytes): {original_bytes}")
-    print(f"Compressed size (bytes): {compressed_bytes:.2f}")
-    print(f"Compression ratio (orig / comp): {compression_ratio:.3f}x")
     print(f"Compression time: {compression_time:.3f} sec")
+    
+    generate_final_report(text, encoded_bitarray, logs, compression_time)
 
     # Save to file (raw bitarray serialization - here we store bitarray.bin)
     bit_length = len(encoded_bitarray)
@@ -476,9 +591,6 @@ def main_demo():
         loaded,
         params,
         freq_model_factory,
-        chunk_size=args.chunk_size,
-        context_size=args.context_size,
-        top_k=args.top_k,
     )
     end_dec = time.time()
     decompression_time = end_dec - start_dec
@@ -486,8 +598,6 @@ def main_demo():
     print("\nRecovered text snippet:", recovered_text[:200])
     print("\nMatch exact:", recovered_text == text)
     print(f"\nDecompression time: {decompression_time:.3f} sec")
-
-
 
 if __name__ == "__main__":
     main_demo()
