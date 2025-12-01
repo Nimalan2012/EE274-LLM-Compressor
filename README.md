@@ -21,10 +21,10 @@ Run the following commands in a Colab cell to clone the repo and navigate to the
 %cd EE274-LLM-Compressor/scl/Project
 ```
 ### 2. Install Dependencies
-Once inside the project folder, install the required libraries. 
+Once inside the project folder, install the required libraries. You only need to install bitarray if Colab is being used.
 
 ```bash
-!pip install bitarray
+!pip install torch transformers numpy bitarray sentencepiece protobuf
 ```
 
 ### 3. Quick Start 
