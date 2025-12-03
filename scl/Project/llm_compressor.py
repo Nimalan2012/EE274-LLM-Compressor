@@ -368,35 +368,53 @@ class LLMFreqModel(FreqModelBase):
         
         Robust version with NaN/Inf handling, float64 precision, and hard cap enforcement.
         """
-        # NaN/Inf Check - Handle numerical instabilities
+        # NaN/Inf Check
         if np.any(np.isnan(probs)) or np.any(np.isinf(probs)):
             probs = np.ones_like(probs) / len(probs)
         
-        # Float64 Precision for better scaling accuracy
+        # Float64 Precision
         probs = probs.astype(np.float64)
         scaled = probs * self.max_total_freq
         
-        # Safe Cast to int64
+        # Safe Cast
         try:
             int_freqs = scaled.astype(np.int64)
         except RuntimeWarning:
             int_freqs = np.ones(len(probs), dtype=np.int64)
 
-        # Zero Prevention - Ensure all frequencies >= 1
+        # Zero Prevention
         np.maximum(int_freqs, 1, out=int_freqs)
         
-        # Normalization
-        total = int_freqs.sum()
-        if total > self.max_total_freq:
-            factor = self.max_total_freq / total
+        # Iterative Cap Enforcement
+        limit = self.params.MAX_ALLOWED_TOTAL_FREQ
+        
+        # Scale down if sum exceeds limits (normalization)
+        current_sum = int_freqs.sum()
+        if current_sum >= limit:
+            # Scale down to be safely under the limit
+            # (limit - 1) guarantees strict inequality
+            factor = (limit - 1) / current_sum
             int_freqs = (int_freqs * factor).astype(np.int64)
             np.maximum(int_freqs, 1, out=int_freqs)
             
-        # Hard Cap - Ensure we never exceed MAX_ALLOWED_TOTAL_FREQ
+        # Hard Cap (The Hammer)
+        # If still >= limit due to rounding/floor(1), subtract from the largest element
         current_sum = int_freqs.sum()
-        if current_sum > self.params.MAX_ALLOWED_TOTAL_FREQ:
+        if current_sum >= limit:
+            diff = current_sum - (limit - 1)
             idx = np.argmax(int_freqs)
-            int_freqs[idx] -= (current_sum - self.params.MAX_ALLOWED_TOTAL_FREQ)
+            
+            if int_freqs[idx] > diff:
+                int_freqs[idx] -= diff
+            else:
+                # Emergency: Scaling didn't work (distribution too flat). 
+                # Forcefully reduce until it fits.
+                int_freqs = (int_freqs * 0.99).astype(np.int64)
+                np.maximum(int_freqs, 1, out=int_freqs)
+                # Fix remainder
+                diff = int_freqs.sum() - (limit - 1)
+                if diff > 0:
+                    int_freqs[np.argmax(int_freqs)] -= diff
 
         return Frequencies(dict(enumerate(int_freqs.tolist())))
 
