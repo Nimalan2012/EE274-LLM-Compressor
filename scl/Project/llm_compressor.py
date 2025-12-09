@@ -210,14 +210,15 @@ def generate_final_report(text, compressed_bits, logs, duration):
 # -------------------------
 class LLMFreqModel(FreqModelBase):
     """
-    Frequency model using a language model (TinyLlama) to provide symbol frequencies.
-    Maintains context tokens and uses model's KV cache for efficiency.
-    1. On each symbol update, advance the model by one token.
-    2. On frequency query, use cached logits if available; otherwise, run model on full context.
-    3. Convert logits → softmax → probabilities → integer frequencies for arithmetic coding.
-    4. Context length is limited to MAX_CONTEXT_FEED for efficiency.
-    5. Frequencies are scaled to fit within MAX_ALLOWED_TOTAL_FREQ.
-    6. Designed for use with SCL arithmetic coder.
+    Frequency model using a language model to provide symbol frequencies via arithmetic coding.
+    
+    Algorithm:
+    1. On each symbol update, advance the model by one token using cached state (KV cache for transformers, cache_params for Mamba).
+    2. When context window is exceeded, perform a hard reset (wipe all cache) to avoid unbounded memory growth.
+    3. On frequency query, use the model's latest cached logits (from previous forward pass).
+    4. Convert logits → softmax (float32 for stability) → probabilities → integer frequencies.
+    5. Scale frequencies to fit within MAX_ALLOWED_TOTAL_FREQ with robust NaN/Inf/zero handling.
+    6. Designed for use with SCL arithmetic coder for lossless compression.
     """
 
     def __init__(
@@ -253,32 +254,23 @@ class LLMFreqModel(FreqModelBase):
         """
         Advances the model by one token with full GPU KV/State cache.
         Logs metrics if metrics_log is provided.
+        Context management: when context window exceeds max_context_window, perform hard reset (wipe all cache).
         """
-        # Logging (before state update)
+        # Log prediction metrics before consuming the symbol
         if self.metrics_log:
             dist = self.get_current_scl_dist()
             self.metrics_log.log(dist, symbol)
 
-        # Run Model Forward (Sequential)
+        # Prepare input
         input_ids = torch.tensor([[symbol]], dtype=torch.long, device=self.device)
 
-        # if self.is_mamba:
-        #     if self.tokens_since_reset >= self.max_context_window:
-        #         self.cache_params = None # Wipe memory
-        #         self.seq_len = 0
-        #         self.tokens_since_reset = 0
-        #     self.tokens_since_reset += 1
-        # else:
-        #     # Transformer: Crop the Tuple
-        #     if self.past_key_values is not None:
-        #         self._crop_kv_cache_()
-        
-        # For context management a hard reset is done instead of sliding window 
+        # Context management: hard reset on window overflow (avoids unbounded memory growth)
+        # Both Mamba and Transformer caches are wiped when window is exceeded.
         if self.tokens_since_reset >= self.max_context_window:
-            self.past_key_values = None  # Wipe Transformer Cache
-            self.cache_params = None     # Wipe Mamba Cache
-            self.seq_len = 0             # Reset Position
-            self.tokens_since_reset = 0
+            self.past_key_values = None  # Wipe Transformer KV cache
+            self.cache_params = None     # Wipe Mamba state cache
+            self.seq_len = 0             # Reset Mamba position counter
+            self.tokens_since_reset = 0  # Reset window counter
             
         self.tokens_since_reset += 1
 
@@ -303,29 +295,6 @@ class LLMFreqModel(FreqModelBase):
                 self.past_key_values = outputs.past_key_values
                 self._cached_next_logits_gpu = outputs.logits[:, -1, :]
 
-    # def _crop_kv_cache_:
-    #     """Forces Transformer KV cache to be a fixed-size Tuple (Sliding Window)."""
-    #     if self.past_key_values is None: return
-
-    #     # Extract tensor list
-    #     current_past = []
-    #     if hasattr(self.past_key_values, "key_cache"): # New HF
-    #         for k, v in zip(self.past_key_values.key_cache, self.past_key_values.value_cache):
-    #             current_past.append((k, v))
-    #     elif isinstance(self.past_key_values, tuple): # Old HF
-    #         current_past = self.past_key_values
-    #     else: return
-
-    #     # Check size
-    #     try: current_len = current_past[0][0].shape[-2]
-    #     except: return
-
-    #     if current_len > self.max_context_window:
-    #         new_past = []
-    #         for k, v in current_past:
-    #             # Keep last N tokens
-    #             new_past.append((k[:, :, -self.max_context_window:, :], v[:, :, -self.max_context_window:, :]))
-    #         self.past_key_values = tuple(new_past)
     
     def get_current_scl_dist(self):
         """
@@ -363,10 +332,15 @@ class LLMFreqModel(FreqModelBase):
     def _probs_to_freqs(self, probs):
         """
         Convert probabilities to integer frequencies within max_total_freq.
-        Ensures no zero frequencies and total frequency does not exceed max_total_freq.
-        This ensures arithmetic coder gets valid frequency tables.
+        Ensures all frequencies are >= 1 and total does not exceed MAX_ALLOWED_TOTAL_FREQ.
         
-        Robust version with NaN/Inf handling, float64 precision, and hard cap enforcement.
+        Steps:
+        1. Handle NaN/Inf: replace with uniform distribution if present.
+        2. Use float64 for scaling precision.
+        3. Scale probabilities and safely cast to int64.
+        4. Enforce minimum frequency of 1 for all symbols (no zeros).
+        5. Normalize: if sum > limit, scale down uniformly.
+        6. Hard cap: if rounding errors cause overshoot, subtract from largest element.
         """
         # NaN/Inf Check
         if np.any(np.isnan(probs)) or np.any(np.isinf(probs)):
@@ -382,23 +356,22 @@ class LLMFreqModel(FreqModelBase):
         except RuntimeWarning:
             int_freqs = np.ones(len(probs), dtype=np.int64)
 
-        # Zero Prevention
+        # Zero Prevention: ensure all frequencies >= 1
         np.maximum(int_freqs, 1, out=int_freqs)
         
-        # Iterative Cap Enforcement
+        # Normalization: scale down if sum exceeds limit
         limit = self.params.MAX_ALLOWED_TOTAL_FREQ
         
-        # Scale down if sum exceeds limits (normalization)
         current_sum = int_freqs.sum()
         if current_sum >= limit:
-            # Scale down to be safely under the limit
-            # (limit - 1) guarantees strict inequality
+            # Scale down to be safely under the limit (limit - 1) guarantees strict inequality
             factor = (limit - 1) / current_sum
             int_freqs = (int_freqs * factor).astype(np.int64)
             np.maximum(int_freqs, 1, out=int_freqs)
             
-        # Hard Cap (The Hammer)
-        # If still >= limit due to rounding/floor(1), subtract from the largest element
+        # Hard Cap: handle rounding errors that may cause overshoot
+        # If normalization still leaves sum >= limit due to floor rounding, 
+        # subtract from the largest element.
         current_sum = int_freqs.sum()
         if current_sum >= limit:
             diff = current_sum - (limit - 1)
@@ -407,43 +380,16 @@ class LLMFreqModel(FreqModelBase):
             if int_freqs[idx] > diff:
                 int_freqs[idx] -= diff
             else:
-                # Emergency: Scaling didn't work (distribution too flat). 
-                # Forcefully reduce until it fits.
+                # Emergency fallback: if single largest element insufficient,
+                # uniformly scale down by 1% and re-apply hard cap.
                 int_freqs = (int_freqs * 0.99).astype(np.int64)
                 np.maximum(int_freqs, 1, out=int_freqs)
-                # Fix remainder
+                # Fix any remaining overshoot
                 diff = int_freqs.sum() - (limit - 1)
                 if diff > 0:
                     int_freqs[np.argmax(int_freqs)] -= diff
 
         return Frequencies(dict(enumerate(int_freqs.tolist())))
-
-# def tokens_from_text_in_chunks(tokenizer, text: str, max_chunk_tokens: int = 512):
-#     """
-#     Yield token chunks from a long text, never exceeding max_chunk_tokens.
-#     This prevents context overflow in the LLM. (Max 2048 tokens for TinyLlama.)
-#     """
-#     start = 0
-#     text_len = len(text)
-#     while start < text_len:
-#         chunk_text = text[start:start + max_chunk_tokens * 4]  # heuristic: 4 chars ~ 1 token
-#         tokens = tokenizer.encode(chunk_text, add_special_tokens=False)
-
-#         max_vocab_id = tokenizer.vocab_size - 1
-#         unk_token_id = tokenizer.unk_token_id if tokenizer.unk_token_id is not None else 0
-#         cleaned_tokens = []
-#         for token_id in tokens:
-#             if token_id >= max_vocab_id:
-#                 # If the token is out-of-bounds (like 50266), replace it with UNK (0)
-#                 cleaned_tokens.append(unk_token_id)
-#             else:
-#                 cleaned_tokens.append(token_id)
-#         tokens = cleaned_tokens
-
-#         if len(tokens) > max_chunk_tokens:
-#             tokens = tokens[:max_chunk_tokens]
-#         yield tokens
-#         start += len(chunk_text)
 
 def text_from_tokens(token_ids: List[int], tokenizer) -> str:
     # Remove special tokens safely (BOS, EOS, UNK, PAD, system tokens)
@@ -514,8 +460,15 @@ def compress(args):
     """
     Compress text file using LLM-based arithmetic coding.
     Maintains single frequency model for continuous context.
+    If no infile is provided, uses a default sentence.
     """
-    print(f"\n=== Compressing: {args.infile} ===")
+    # Use default sentence if no infile provided
+    if args.infile:
+        print(f"\n=== Compressing: {args.infile} ===")
+        with open(args.infile, "r", encoding="utf-8") as f:
+            text = f.read()
+    else:
+        text = "The weather today is sunny and pleasant. I expect light winds and warm sunshine."
     
     # Load model and tokenizer
     dtype = torch.float16 if args.dtype == "fp16" else torch.float32
@@ -525,11 +478,8 @@ def compress(args):
         hf_token=args.hf_token
     )
     
-    # Load input text
-    with open(args.infile, "r", encoding="utf-8") as f:
-        text = f.read()
-    
-    # Add Special Tokens (Preserves start-of-string spaces)
+    # Tokenize with special tokens enabled
+    # add_special_tokens=True includes BOS token, which helps preserve leading whitespace.
     raw_tokens = tokenizer.encode(text, add_special_tokens=True, truncation=False)
     
     # Correct Max Vocab (Includes extra space tokens)
@@ -661,7 +611,7 @@ def main_demo():
     p.add_argument("--model", type=str, default="tinyllama", choices=["tinyllama", "llama3", "mamba", "mamba1.4b"], help="Model backend")
     p.add_argument("--dtype", type=str, default="fp16", choices=["fp16", "fp32"], help="Numeric precision")
     p.add_argument("--hf-token", type=str, default=None, help="HuggingFace token (optional)")
-    p.add_argument("--infile", type=str, default=None, help="Input text file for compression")
+    p.add_argument("--infile", type=str, default=None, help="Input text file for compression (optional; uses default text if omitted)")
     p.add_argument("--outfile", type=str, default="out.sclbit", help="Output compressed file")
     p.add_argument("--context-size", type=int, default=512, help="Context size fed to LLM")
     p.add_argument("--precision", type=int, default=32, help="Arithmetic coder precision (bits)")
@@ -672,11 +622,9 @@ def main_demo():
 
     # Execute based on mode
     if args.mode in ["compress", "all"]:
-        if not args.infile:
-            print("Error: --infile required for compression")
-            return
+        # compress() provides a default text when --infile is omitted
         compress(args)
-    
+
     if args.mode in ["decompress", "all"]:
         decompress(args)
 
