@@ -1,5 +1,5 @@
 # EE274-LLM-Compressor
-This project demonstrates the implementation of LLM-based compression integrated with SCL's (Stanford Compression Library) arithmetic coder, for lossless data compression using language models. The primary script, llm_compressor.py, facilitates the compression and decompression of data. 
+This project demonstrates the implementation of LLM-based compression integrated with SCL's (Stanford Compression Library) arithmetic coder, for lossless data compression using language models. The primary script, llm_compressor.py, facilitates the compression and decompression of data. EE274_project.ipynb documents the results of the various experiments tested in Google Colab.
 
 ## Installation & Setup
 For the best performance (and access to GPUs), we recommend running this project on **Google Colab**. Other supported runtimes are **Apple MPS** (macOS) and **CPU-only** for small tests.
